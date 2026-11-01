@@ -1,0 +1,184 @@
+
+name: Build EREN OS Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract EREN OS source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f settings.gradle.kts && -f app/build.gradle.kts ]]; then
+            echo "Project already extracted."
+            exit 0
+          fi
+
+          archive="$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 2 -type f \
+            -iname 'EREN-OS-Debian-PTY-Source*.zip' \
+            -print -quit)"
+
+          if [[ -z "$archive" ]]; then
+            echo "::error::EREN OS source ZIP was not found."
+            echo "Upload EREN-OS-Debian-PTY-Source-v1.3.zip to repository root."
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y unzip
+
+          extract_dir="$RUNNER_TEMP/eren-source"
+          mkdir -p "$extract_dir"
+          unzip -q "$archive" -d "$extract_dir"
+
+          project_root="$(find "$extract_dir" \
+            -type f -name settings.gradle.kts \
+            -print -quit | xargs -r dirname)"
+
+          if [[ -z "$project_root" ||
+                ! -f "$project_root/app/build.gradle.kts" ]]; then
+            echo "::error::Invalid Android project inside ZIP."
+            exit 1
+          fi
+
+          cp -a "$project_root"/. "$GITHUB_WORKSPACE"/
+
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+
+          echo "Source extracted successfully."
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1"
+
+      - name: Build static PRoot for ARM64
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone --depth 1 \
+            https://github.com/berilevi/proot-static.git \
+            "$RUNNER_TEMP/proot-static"
+
+          cd "$RUNNER_TEMP/proot-static"
+
+          NDK="$ANDROID_HOME/ndk/28.2.13676358" \
+            REPO_ARTIFACT_DIR="$PWD/dist/aarch64" \
+            tools/build-static-aarch64.sh
+
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets/linux"
+
+          install -m 755 dist/aarch64/proot \
+            "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libproot.so"
+
+          install -m 755 dist/aarch64/loader \
+            "$GITHUB_WORKSPACE/app/src/main/assets/linux/proot-loader"
+
+          install -m 755 dist/aarch64/loader32 \
+            "$GITHUB_WORKSPACE/app/src/main/assets/linux/proot-loader32"
+
+      - name: Download Debian ARM64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          base="https://images.linuxcontainers.org/images/debian/bookworm/arm64/default/"
+          listing="$(curl -fsSL "$base")"
+
+          stamp="$(printf '%s' "$listing" |
+            grep -oE '[0-9]{8}_[0-9]{2}:[0-9]{2}' |
+            sort -u | tail -n 1)"
+
+          test -n "$stamp"
+
+          mkdir -p app/src/main/assets/linux
+
+          curl -fL --retry 3 \
+            "${base}${stamp}/rootfs.tar.xz" \
+            -o app/src/main/assets/linux/debian-rootfs.tar.xz
+
+          xz -t app/src/main/assets/linux/debian-rootfs.tar.xz
+
+      - name: Bundle xterm.js
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          npm install --prefix "$RUNNER_TEMP/eren-xterm" \
+            --no-save \
+            @xterm/xterm@5.5.0 \
+            @xterm/addon-fit@0.10.0
+
+          mkdir -p app/src/main/assets/eren-os/vendor
+
+          cp "$RUNNER_TEMP/eren-xterm/node_modules/@xterm/xterm/lib/xterm.js" \
+            app/src/main/assets/eren-os/vendor/xterm.js
+
+          cp "$RUNNER_TEMP/eren-xterm/node_modules/@xterm/xterm/css/xterm.css" \
+            app/src/main/assets/eren-os/vendor/xterm.css
+
+          cp "$RUNNER_TEMP/eren-xterm/node_modules/@xterm/addon-fit/lib/addon-fit.js" \
+            app/src/main/assets/eren-os/vendor/addon-fit.js
+
+          test -s app/src/main/assets/eren-os/vendor/xterm.js
+          test -s app/src/main/assets/eren-os/vendor/addon-fit.js
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          apk="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$apk"
+
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libproot.so'
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/liberenpty.so'
+          unzip -l "$apk" | grep -q 'assets/linux/debian-rootfs.tar.xz'
+          unzip -l "$apk" | grep -q 'assets/eren-os/vendor/xterm.js'
+          unzip -l "$apk" | grep -q 'assets/eren-os/vendor/addon-fit.js'
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EREN-OS-Debian-PTY-arm64-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
