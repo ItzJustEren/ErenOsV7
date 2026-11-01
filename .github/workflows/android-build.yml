@@ -1,4 +1,3 @@
-
 name: Build EREN OS Android APK
 
 on:
@@ -71,6 +70,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android SDK components
         run: |
